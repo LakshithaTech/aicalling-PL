@@ -1,0 +1,42 @@
+# Environment variables & secrets
+.env
+.env.*
+.env.local
+!.env.example
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Audio recordings & media dumps
+allcallrecordings/
+generated_audio/
+*.wav
+*.mp3
+*.ulaw
+*.ogg
+*.flac
+*.m4a
+
+# Logs & temp files
+*.log
+server-log.txt
+
+# Editor / IDE directories
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS files
+.DS_Store
+Thumbs.db

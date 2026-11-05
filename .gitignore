@@ -17,9 +17,11 @@ ENV/
 env.bak/
 venv.bak/
 
-# Audio recordings & media dumps
-allcallrecordings/
-generated_audio/
+# Audio recordings & media dumps (keep folder, ignore files inside)
+allcallrecordings/*
+!allcallrecordings/.gitkeep
+generated_audio/*
+!generated_audio/.gitkeep
 *.wav
 *.mp3
 *.ulaw

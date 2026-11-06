@@ -31,6 +31,9 @@ from components.questionnaire import (
     is_closing_reply,
     detect_yes,
     detect_no,
+    is_interest_rate_or_details_query,
+    is_repeat_or_clarification_query,
+    get_opening_text,
     speak_opening_message,
 )
 from components.db import (

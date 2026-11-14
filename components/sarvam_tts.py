@@ -187,48 +187,28 @@ def get_async_sarvam_client() -> AsyncSarvamAI:
 
 
 def normalize_speech_text(text: str, language: str = "te") -> str:
-
-    """Normalize text (numbers, percentages, whitespaces) for smooth speech synthesis."""
-
+    """Normalize common loan percentages to spoken words for natural TTS."""
+    text = (text or "").strip()
     if language == "te":
-
-        text = re.sub(
-
-            r'&#x39;\\.&#x39;9\s\*%\s\*(శాతం)?',
-
-            'నైన్ పాయింట్ నైన్ నైన్ పర్సెంట్ ',
-
-            text
-
+        replacements = (
+            (r"(?<!\d)7\.5\s*%", "సెవెన్ పాయింట్ ఫైవ్ పర్సెంట్"),
+            (r"(?<!\d)9\.99\s*%", "నైన్ పాయింట్ నైన్ నైన్ పర్సెంట్"),
+            (r"(?<!\d)18\s*%", "ఎయిటీన్ పర్సెంట్"),
         )
-
-        text = re.sub(
-
-            r'18\s*%\s*(శాతం)?',
-
-            'ఎయిటీన్ పర్సెంట్ ',
-
-            text
-
+    else:
+        replacements = (
+            (r"(?<!\d)7\.5\s*%", "seven point five percent"),
+            (r"(?<!\d)9\.99\s*%", "nine point nine nine percent"),
+            (r"(?<!\d)18\s*%", "eighteen percent"),
         )
-
-    elif language == "en":
-        text = re.sub(r'9\.99\s*%', 'nine point nine nine percent', text)
-        text = re.sub(r'18\s*%', 'eighteen percent', text)
-
-    return re.sub(r'\s+', ' ', text).strip()
-
-
-
+    for pattern, spoken in replacements:
+        text = re.sub(pattern, spoken, text, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 # --------------------------------------------------
-
 # WORD & CLAUSE BOUNDARY CHUNKER
-
 # --------------------------------------------------
-
-
 
 def split_into_speech_chunks(
 
@@ -946,11 +926,10 @@ async def play_chunked_speech(
     full_text = " ".join(all_chunks)
 
     total_duration = total_bytes / 8000.0
-    playback_end = (t_first_sent or time.time()) + total_duration
 
-    print(f"[TIMING] All audio transmitted to Plivo buffer: {total_bytes} bytes (~{total_duration:.2f}s speech, ends at +{playback_end - t_start:.2f}s)")
+    print(f"[TIMING] All audio transmitted to Plivo buffer: {total_bytes} bytes (~{total_duration:.2f}s speech)")
 
-    return total_duration, total_bytes, playback_end
+    return total_duration, total_bytes, full_text
 
 
 

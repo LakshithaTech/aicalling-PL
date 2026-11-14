@@ -13,7 +13,8 @@ get_db_pool = database.get_db_pool
 save_call_record = database.save_call_record
 save_recording_data = database.save_recording_data
 
-def fetch_all_calls() -> Dict[str, Any]:
+
+def fetch_all_calls(loan_type: Optional[str] = None) -> Dict[str, Any]:
     """Retrieve recorded calls from PostgreSQL public.ai_agent_calls table."""
     p = get_db_pool()
     if not p:
@@ -22,13 +23,24 @@ def fetch_all_calls() -> Dict[str, Any]:
     try:
         conn = p.getconn()
         with conn.cursor() as cur:
-            cur.execute("""
-                SELECT id, customer_name, phone_number, loan_type, loan_amount,
-                       call_status, lead_status, call_duration_seconds,
-                       conversation_json, created_at, call_sid, loan_purpose
-                FROM public.ai_agent_calls
-                ORDER BY id ASC;
-            """)
+            normalized_lt = (loan_type or "").strip().lower()
+            if normalized_lt:
+                cur.execute("""
+                    SELECT id, customer_name, phone_number, loan_type, loan_amount,
+                           call_status, lead_status, call_duration_seconds,
+                           conversation_json, created_at, call_sid, loan_purpose
+                    FROM public.ai_agent_calls
+                    WHERE LOWER(COALESCE(loan_type, '')) = %s
+                    ORDER BY id DESC;
+                """, (normalized_lt,))
+            else:
+                cur.execute("""
+                    SELECT id, customer_name, phone_number, loan_type, loan_amount,
+                           call_status, lead_status, call_duration_seconds,
+                           conversation_json, created_at, call_sid, loan_purpose
+                    FROM public.ai_agent_calls
+                    ORDER BY id ASC;
+                """)
             rows = cur.fetchall()
             calls = []
             for r in rows:
@@ -79,6 +91,7 @@ def fetch_all_calls() -> Dict[str, Any]:
             except Exception:
                 pass
 
+
 def fetch_call_recording(call_id: int, all_call_recordings_dir: Optional[Path] = None) -> tuple[Optional[bytes], Optional[str]]:
     """Retrieve audio bytes and call_sid from DB or sync from disk if needed."""
     p = get_db_pool()
@@ -109,6 +122,135 @@ def fetch_call_recording(call_id: int, all_call_recordings_dir: Optional[Path] =
                     except Exception as sync_err:
                         print("Notice: Error syncing disk audio to DB:", repr(sync_err))
             return audio_bytes, call_sid
+    finally:
+        if conn and p:
+            try:
+                p.putconn(conn)
+            except Exception:
+                pass
+
+
+def _cleanup_recording_files(call_sid: Optional[str], all_call_recordings_dir: Optional[Path] = None) -> None:
+    """Remove local .mp3 / .ulaw / .wav recording files for a deleted call_sid, ignoring missing files."""
+    if not call_sid:
+        return
+    safe_sid = Path(str(call_sid)).name
+    if not safe_sid or safe_sid != str(call_sid):
+        return
+    recordings_dir = all_call_recordings_dir or (Path(__file__).resolve().parent.parent / "allcallrecordings")
+    for ext in ("mp3", "ulaw", "wav"):
+        candidate = recordings_dir / f"call_{safe_sid}.{ext}"
+        try:
+            if candidate.is_file():
+                candidate.unlink()
+        except Exception as file_err:
+            print(f"Notice: Could not delete local recording {candidate}:", repr(file_err))
+
+
+def delete_personal_loan_call(call_id: int, all_call_recordings_dir: Optional[Path] = None) -> Dict[str, Any]:
+    """Delete a single PostgreSQL call row strictly if loan_type == 'personal_loan'."""
+    p = get_db_pool()
+    if not p:
+        return {"success": False, "error": "Database pool not available"}
+    conn = None
+    try:
+        conn = p.getconn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, call_sid, loan_type FROM public.ai_agent_calls WHERE id = %s;",
+                (call_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return {"success": False, "not_found": True, "error": f"Call ID #{call_id} not found"}
+
+            loan_type_val = str(row[2] or "").strip().lower()
+            if loan_type_val != "personal_loan":
+                return {
+                    "success": False,
+                    "forbidden": True,
+                    "error": f"Refused: Call ID #{call_id} has loan_type='{row[2]}' (only 'personal_loan' rows can be deleted here).",
+                }
+
+            cur.execute(
+                """
+                DELETE FROM public.ai_agent_calls
+                WHERE id = %s AND LOWER(COALESCE(loan_type, '')) = 'personal_loan'
+                RETURNING id, call_sid;
+                """,
+                (call_id,),
+            )
+            deleted = cur.fetchone()
+        conn.commit()
+        if not deleted:
+            return {"success": False, "not_found": True, "error": f"Call ID #{call_id} not found"}
+
+        _cleanup_recording_files(deleted[1], all_call_recordings_dir)
+        return {"success": True, "deleted_id": deleted[0], "call_sid": deleted[1]}
+    except Exception as exc:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        return {"success": False, "error": str(exc)}
+    finally:
+        if conn and p:
+            try:
+                p.putconn(conn)
+            except Exception:
+                pass
+
+
+def delete_personal_loan_calls_batch(
+    call_ids: Optional[List[int]] = None,
+    delete_test_only: bool = False,
+    all_call_recordings_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Batch-delete PostgreSQL call rows strictly restricted to loan_type == 'personal_loan'."""
+    p = get_db_pool()
+    if not p:
+        return {"success": False, "error": "Database pool not available"}
+
+    conn = None
+    try:
+        conn = p.getconn()
+        deleted_rows = []
+        with conn.cursor() as cur:
+            if delete_test_only and not call_ids:
+                return {"success": False, "bad_request": True,
+                        "error": "Bulk deletion by test phone number is disabled. Supply explicit call IDs."}
+            else:
+                clean_ids = sorted({int(cid) for cid in (call_ids or []) if int(cid) > 0})
+                if not clean_ids:
+                    return {"success": False, "bad_request": True, "error": "No valid Personal Loan call IDs provided"}
+                cur.execute(
+                    """
+                    DELETE FROM public.ai_agent_calls
+                    WHERE id = ANY(%s)
+                      AND LOWER(COALESCE(loan_type, '')) = 'personal_loan'
+                    RETURNING id, call_sid;
+                    """,
+                    (clean_ids,),
+                )
+                deleted_rows = cur.fetchall()
+        conn.commit()
+
+        for _, sid in deleted_rows:
+            _cleanup_recording_files(sid, all_call_recordings_dir)
+
+        return {
+            "success": True,
+            "deleted_count": len(deleted_rows),
+            "deleted_ids": [r[0] for r in deleted_rows],
+        }
+    except Exception as exc:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        return {"success": False, "error": str(exc)}
     finally:
         if conn and p:
             try:

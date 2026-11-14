@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DB_HOST = os.getenv("DB_HOST", "")
-DB_PORT = int(os.getenv("DB_PORT", "5432"))
+DB_PORT = int(os.getenv("DB_PORT", "15409"))
 DB_NAME = os.getenv("DB_NAME", "")
 DB_USER = os.getenv("DB_USER", "")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
@@ -28,9 +28,6 @@ def get_db_pool() -> Optional[pool.ThreadedConnectionPool]:
     """Initialize or return the thread-safe connection pool."""
     global _db_pool
     if _db_pool is None:
-        if not DB_HOST or not DB_PASSWORD:
-            print("Database configuration missing (DB_HOST or DB_PASSWORD). Database operations disabled.")
-            return None
         try:
             _db_pool = pool.ThreadedConnectionPool(
                 minconn=1,
@@ -137,7 +134,8 @@ def save_call_record(
 
     clean_phone = (phone_number or "").strip()
     if not clean_phone:
-        clean_phone = "+919999999999"
+        print("Missing customer phone; refusing to save record with fabricated number")
+        return None
 
     # Enforce allowed loan_type
     allowed_loan_types = {
@@ -304,3 +302,74 @@ def save_recording_data(call_sid: str, recording_bytes: bytes) -> bool:
             except Exception:
                 pass
 
+
+
+
+def _normalized_phone(phone_number: str) -> str:
+    digits = re.sub(r"\D", "", phone_number or "")
+    if len(digits) == 10:
+        return "91" + digits
+    if len(digits) == 11 and digits.startswith("0"):
+        return "91" + digits[1:]
+    return digits
+
+# Do-not-call persistence is separate from a call's transcript. Check it BEFORE dialling.
+def save_do_not_call(phone_number: str) -> bool:
+    """Persist opt-out. False means not confirmed; callers must not claim success."""
+    number = _normalized_phone(phone_number)
+    if len(number) < 10:
+        return False
+    p = get_db_pool()
+    if not p:
+        return False
+    conn = None
+    try:
+        conn = p.getconn()
+        with conn.cursor() as cur:
+            cur.execute("""CREATE TABLE IF NOT EXISTS public.ai_agent_do_not_call (
+                phone_digits TEXT PRIMARY KEY,
+                opted_out_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )""")
+            cur.execute("""INSERT INTO public.ai_agent_do_not_call(phone_digits)
+                VALUES (%s) ON CONFLICT (phone_digits) DO UPDATE
+                SET opted_out_at = CURRENT_TIMESTAMP""", (number,))
+        conn.commit()
+        return True
+    except Exception as exc:
+        if conn:
+            conn.rollback()
+        print("Failed to save do-not-call:", type(exc).__name__)
+        return False
+    finally:
+        if conn:
+            p.putconn(conn)
+
+
+def is_do_not_call(phone_number: str) -> Optional[bool]:
+    """True: opted out; False: allowed; None: DB unavailable (fail closed)."""
+    digits = _normalized_phone(phone_number)
+    if len(digits) < 10:
+        return None
+    p = get_db_pool()
+    if not p:
+        return None
+    conn = None
+    try:
+        conn = p.getconn()
+        with conn.cursor() as cur:
+            cur.execute("""CREATE TABLE IF NOT EXISTS public.ai_agent_do_not_call (
+                phone_digits TEXT PRIMARY KEY,
+                opted_out_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )""")
+            cur.execute("SELECT 1 FROM public.ai_agent_do_not_call WHERE phone_digits = %s", (digits,))
+            exists = cur.fetchone() is not None
+        conn.commit()
+        return exists
+    except Exception as exc:
+        if conn:
+            conn.rollback()
+        print("Failed to check do-not-call:", type(exc).__name__)
+        return None
+    finally:
+        if conn:
+            p.putconn(conn)

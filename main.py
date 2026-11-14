@@ -4,10 +4,11 @@ import time
 import base64
 import uuid
 import json
+import threading
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, quote
 
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
     try:
@@ -21,9 +22,11 @@ if sys.stderr and hasattr(sys.stderr, "reconfigure"):
         pass
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, UploadFile, File
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
+import database
+from components.personal_loan_flow import CallFlow, Turn, opening, question, respond, confirmation_after_save
 from sarvamai import SarvamAI, AsyncSarvamAI, RealtimeAudioInput
 import plivo
 import asyncio
@@ -43,6 +46,7 @@ from components.sarvam_tts import (
     synthesize_sarvam_speech,
     make_sarvam_audio,
     play_chunked_speech,
+    cancel_call_tts,
 )
 from components.openai_service import (
     OPENAI_MODEL,
@@ -50,6 +54,7 @@ from components.openai_service import (
     get_openai_client,
     generate_chat_reply,
     generate_sync_chat_reply,
+    stream_chat_reply_chunks,
 )
 from components.plivo_service import (
     ACTIVE_CALL_METADATA,
@@ -57,6 +62,7 @@ from components.plivo_service import (
     hangup_plivo_call,
     start_plivo_recording,
     send_audio_to_plivo,
+    clear_plivo_audio_queue,
     download_and_save_recording,
 )
 from components.questionnaire import (
@@ -66,20 +72,13 @@ from components.questionnaire import (
     is_closing_reply,
     detect_yes,
     detect_no,
-    is_continuation_response,
-    is_confusion_or_identity_query,
-    is_interest_rate_or_details_query,
-    is_repeat_or_clarification_query,
-    is_company_response,
-    normalize_hindi_stt,
-    is_callback_time_query,
-    is_human_agent_or_callback_request,
     is_recording_announcement,
     detect_explicit_language_switch,
     detect_initial_call_language,
     is_telugu_speech,
     get_recording_followup,
     get_opening_text,
+    get_personal_loan_opening_text,
     speak_opening_message,
 )
 from components.db import (
@@ -88,12 +87,25 @@ from components.db import (
     save_recording_data,
     fetch_all_calls,
     fetch_call_recording,
+    delete_personal_loan_call,
+    delete_personal_loan_calls_batch,
+)
+from components.auth import (
+    COOKIE_NAME,
+    TOKEN_EXPIRE_HOURS,
+    authenticate_admin,
+    extract_client_ip,
+    fetch_login_logs,
+    init_auth,
+    register_admin,
+    require_admin_user,
 )
 
 load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
-app = FastAPI(title="AI Voice Agent API")
+app = FastAPI(title="Personal Loan AI Voice Agent API")
 print("RUNNING MAIN FILE:", Path(__file__).resolve())
+init_auth()
 
 AUDIO_DIR = Path("generated_audio")
 AUDIO_DIR.mkdir(exist_ok=True)
@@ -105,22 +117,101 @@ CALL_STATE: Dict[str, Any] = {}
 
 class CallRequest(BaseModel):
     to_number: str
+    customer_name: Optional[str] = None
+
+
+class AdminLoginRequest(BaseModel):
+    identifier: Optional[str] = ""
+    username: Optional[str] = ""
+    email: Optional[str] = ""
+    password: str = ""
+
+
+class AdminRegisterRequest(BaseModel):
+    username: str = ""
+    email: str = ""
+    password: str = ""
+
+
+def _set_auth_cookie(request: Request, response: Response, token: str) -> None:
+    is_https = (
+        request.url.scheme == "https"
+        or request.headers.get("x-forwarded-proto", "").lower() == "https"
+    )
+    response.set_cookie(
+        key=COOKIE_NAME,
+        value=token,
+        max_age=TOKEN_EXPIRE_HOURS * 3600,
+        httponly=True,
+        samesite="lax",
+        secure=is_https,
+        path="/",
+    )
 
 
 @app.get("/")
 def health():
     return {
         "status": "ok",
-        "service": "AI Voice Agent",
+        "service": "Personal Loan AI Voice Agent",
     }
+
+
+@app.post("/auth/login")
+def admin_login(payload: AdminLoginRequest, request: Request, response: Response):
+    ident = (payload.identifier or payload.username or payload.email or "").strip()
+    result = authenticate_admin(
+        identifier=ident,
+        password=payload.password or "",
+        ip_address=extract_client_ip(request),
+        user_agent=request.headers.get("user-agent"),
+    )
+    _set_auth_cookie(request, response, result["token"])
+    return result
+
+
+@app.post("/auth/register")
+def admin_register(payload: AdminRegisterRequest, request: Request, response: Response):
+    result = register_admin(
+        username=payload.username,
+        email=payload.email,
+        password=payload.password,
+        ip_address=extract_client_ip(request),
+        user_agent=request.headers.get("user-agent"),
+    )
+    _set_auth_cookie(request, response, result["token"])
+    return result
+
+
+@app.post("/auth/logout")
+def admin_logout(response: Response):
+    response.delete_cookie(key=COOKIE_NAME, path="/")
+    return {"success": True, "message": "Signed out from LMV_HL Calling"}
+
+
+@app.get("/auth/me")
+def admin_me(current_admin: Dict[str, Any] = Depends(require_admin_user)):
+    return {"authenticated": True, "user": current_admin}
+
+
+@app.get("/auth/logs")
+def admin_login_logs(
+    limit: int = 200,
+    current_admin: Dict[str, Any] = Depends(require_admin_user),
+):
+    result = fetch_login_logs(limit=limit)
+    if result.get("error"):
+        raise HTTPException(status_code=500, detail=result["error"])
+    return result
 
 
 @app.get("/audio.wav")
 def generate_greeting_audio():
     try:
         filename = make_sarvam_audio(
-            "Hello! Thank you for calling. How can I help you today?",
+            get_personal_loan_opening_text(),
             "greeting.wav",
+            language="en",
             audio_dir=AUDIO_DIR,
         )
     except Exception as exc:
@@ -152,119 +243,183 @@ def get_reply_audio(filename: str):
     )
 
 
-@app.post("/process-speech")
-async def process_speech(request: Request):
+async def process_flow_turn(flow: CallFlow, text: str, call_sid: str,
+                            phone_number: Optional[str], history: List[Dict[str, Any]],
+                            started_at: datetime, detected_language: Optional[str] = None) -> Turn:
+    """One shared conversation engine for WebSocket and HTTP fallback routes."""
+    history.append({"role": "user", "content": text})
+    turn = await respond(flow, text, detected_language)
+    if turn.persist:
+        if turn.persist == "opt_out":
+            saved = bool(phone_number) and await asyncio.to_thread(database.save_do_not_call, phone_number)
+        else:
+            # Persist callback preference before claiming it is recorded.
+            record = history + [{"role": "system", "content":
+                                  "CALL_STRUCTURED_DATA=" + json.dumps(flow.snapshot(), ensure_ascii=False)}]
+            saved = bool(phone_number and call_sid) and bool(await asyncio.to_thread(
+                save_call_record, call_sid=call_sid, phone_number=phone_number,
+                conversation_history=record, call_status="completed",
+                lead_status="follow_up", loan_type="personal_loan",
+                customer_name=flow.customer_name or None,
+                call_started_at=started_at, call_ended_at=datetime.now(timezone.utc),
+                loan_purpose=flow.answers.get("purpose", "Personal loan callback request")))
+        turn.text = confirmation_after_save(flow, turn.persist, bool(saved))
+    history.append({"role": "assistant", "content": turn.text})
+    return turn
+
+
+async def _http_speech_route(request: Request, action_path: str):
+    """Plivo GetInput alternative to the low-latency WebSocket route."""
+    from xml.sax.saxutils import escape
     base_url = get_base_url()
     if not base_url:
         raise HTTPException(status_code=500, detail="PUBLIC_BASE_URL is missing")
-
-    body = (await request.body()).decode("utf-8")
-    form_data = parse_qs(body)
-
-    customer_text = form_data.get("SpeechResult", [""])[0].strip()
-    call_sid = form_data.get("CallSid", ["unknown"])[0]
-
-    state = CALL_STATE.setdefault(
-        call_sid,
-        {
-            "messages": [],
-            "confirm_end": False,
-        },
-    )
-
-    should_hang_up = False
-
-    if state["confirm_end"]:
-        if customer_text.lower().strip() in {
-            "yes", "yes please", "yes end the call", "yes, end the call",
-            "please end the call", "end the call", "goodbye", "bye",
-        }:
-            reply_text = "Thank you for calling. Have a nice day."
-            should_hang_up = True
-            state["confirm_end"] = False
-        elif detect_no(customer_text):
-            reply_text = "Of course. I'm happy to help. What else can I assist you with?"
-            state["confirm_end"] = False
-        else:
-            reply_text = (
-                "Sorry, I didn't understand. "
-                "Would you like me to end the call now? Please say yes or no."
-            )
-    elif not customer_text:
-        reply_text = "I'm sorry, I didn't catch that. Could you please repeat it?"
-    elif detect_end_request(customer_text):
-        state["confirm_end"] = True
-        reply_text = "Would you like me to end the call now? Please say yes or no."
-    else:
-        try:
-            state["messages"].append({
-                "role": "user",
-                "content": customer_text,
-            })
-            state["messages"] = state["messages"][-12:]
-
-            messages_payload = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                *state["messages"],
-            ]
-            reply_text = generate_sync_chat_reply(messages_payload, max_tokens=150)
-            if not reply_text:
-                reply_text = "I'm sorry. Could you please repeat that?"
-
-            state["messages"].append({
-                "role": "assistant",
-                "content": reply_text,
-            })
-            state["messages"] = state["messages"][-12:]
-        except Exception:
-            print("OpenAI response generation failed")
-            reply_text = (
-                "I'm sorry, I'm having trouble answering right now. "
-                "Could you please try again?"
-            )
-
     try:
-        filename = f"{uuid.uuid4().hex}.wav"
-        make_sarvam_audio(reply_text, filename, audio_dir=AUDIO_DIR)
+        form_data = dict(await request.form())
     except Exception:
-        print("Sarvam audio generation failed")
-        fallback_xml = """
-        <Response>
-            <Say language="en-US" voice="woman">
-                I'm sorry, the voice service is temporarily unavailable.
-            </Say>
-            <Hangup/>
-        </Response>
-        """
-        return Response(content=fallback_xml.strip(), media_type="application/xml")
-
-    reply_audio_url = f"{base_url}/reply/{filename}"
-
-    if should_hang_up:
-        xml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Play>{reply_audio_url}</Play>
-    <Hangup/>
-</Response>"""
-        return Response(content=xml, media_type="application/xml")
-
-    action_url = f"{base_url}/process-speech"
-
-    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <GetInput inputType="speech"
-              action="{action_url}"
-              method="POST"
-              executionTimeout="30">
-        <Play>{reply_audio_url}</Play>
-    </GetInput>
-    <Redirect method="POST">{action_url}</Redirect>
-</Response>"""
+        form_data = parse_qs((await request.body()).decode("utf-8"))
+        form_data = {k: v[0] for k, v in form_data.items()}
+    text = (form_data.get("SpeechResult") or form_data.get("Speech")
+            or request.query_params.get("SpeechResult") or "").strip()
+    call_sid = (form_data.get("CallUUID") or form_data.get("CallSid")
+                or request.query_params.get("CallUUID") or "unknown")
+    metadata = ACTIVE_CALL_METADATA.get(call_sid, {})
+    phone = metadata.get("phone_number")
+    if not phone:
+        from_no, to_no = form_data.get("From", ""), form_data.get("To", "")
+        own_no = normalize_phone_digits(os.getenv("PLIVO_PHONE_NUMBER", ""))
+        phone = to_no if normalize_phone_digits(from_no) == own_no else from_no
+    state = CALL_STATE.setdefault(call_sid, {"messages": [], "flow": CallFlow(),
+                                             "started_at": datetime.now(timezone.utc)})
+    flow = state.setdefault("flow", CallFlow())
+    if flow.status == "ended":
+        return Response(content="<Response><Hangup/></Response>", media_type="application/xml")
+    if metadata.get("customer_name"):
+        flow.customer_name = metadata["customer_name"]
+    state.setdefault("messages", [])
+    if text:
+        state["silence_count"] = 0
+        turn = await process_flow_turn(flow, text, call_sid, phone, state["messages"], state["started_at"])
+        reply_text = turn.text
+    else:
+        turn = Turn("")
+        reply_text = question(flow)
+    state["current_question"] = question(flow) if flow.status != "ended" else ""
+    filename = f"{uuid.uuid4().hex}.wav"
+    try:
+        await asyncio.to_thread(make_sarvam_audio, reply_text, filename,
+                                language=flow.language, audio_dir=AUDIO_DIR)
+    except Exception as exc:
+        print("Sarvam HTTP speech generation failed:", type(exc).__name__)
+        return Response(content="<Response><Say>Sorry, there is a voice service problem.</Say><Hangup/></Response>",
+                        media_type="application/xml")
+    audio_url = escape(f"{base_url}/reply/{filename}")
+    action_url = escape(f"{base_url}{action_path}")
+    timeout_url = escape(f"{base_url}/plivo-timeout?CallUUID={quote(call_sid)}")
+    if turn.close:
+        xml = f'<Response><Play>{audio_url}</Play><Hangup/></Response>'
+    else:
+        xml = (f'<Response><GetInput inputType="speech" action="{action_url}" '
+               f'method="POST" executionTimeout="30"><Play>{audio_url}</Play>'
+               f'</GetInput><Redirect method="POST">{timeout_url}</Redirect></Response>')
     return Response(content=xml, media_type="application/xml")
 
 
+@app.post("/process-speech")
+async def process_speech(request: Request):
+    return await _http_speech_route(request, "/process-speech")
+
+
+OUTBOUND_DIAL_LOCK = threading.Lock()
+ACTIVE_OUTBOUND_DIALS: Dict[str, Dict[str, Any]] = {}
+MIN_REDIAL_COOLDOWN_SEC = 15.0
+ACTIVE_CALL_GUARD_TTL_SEC = 180.0
+
+
+def normalize_phone_digits(num: str) -> str:
+    d = "".join([c for c in str(num or "") if c.isdigit()])
+    if len(d) == 10:
+        return "91" + d
+    if d.startswith("0"):
+        return "91" + d[1:]
+    return d
+
+
+def _release_outbound_guard(phone_number: str = "", call_uuid: str = "") -> None:
+    norm_p = normalize_phone_digits(phone_number) if phone_number else ""
+    with OUTBOUND_DIAL_LOCK:
+        if norm_p and norm_p in ACTIVE_OUTBOUND_DIALS:
+            entry = ACTIVE_OUTBOUND_DIALS[norm_p]
+            if not call_uuid or entry.get("call_uuid") == call_uuid:
+                ACTIVE_OUTBOUND_DIALS.pop(norm_p, None)
+        if call_uuid:
+            stale_keys = [
+                k for k, v in ACTIVE_OUTBOUND_DIALS.items()
+                if v.get("call_uuid") == call_uuid
+            ]
+            for k in stale_keys:
+                ACTIVE_OUTBOUND_DIALS.pop(k, None)
+
+
+def _is_uuid_active_on_plivo(client: Any, call_uuid: str) -> bool:
+    if not call_uuid:
+        return False
+    active_ids = set()
+    try:
+        live_res = client.calls.live_call_list_ids()
+        if isinstance(live_res, dict):
+            active_ids.update(live_res.get("calls", []) or [])
+    except Exception:
+        pass
+    try:
+        queued_res = client.calls.queued_call_list_ids()
+        if isinstance(queued_res, dict):
+            active_ids.update(queued_res.get("calls", []) or [])
+    except Exception:
+        pass
+    return call_uuid in active_ids
+
+
+def _is_call_completed_in_db(call_sid: str) -> bool:
+    if not call_sid:
+        return False
+    p = get_db_pool()
+    if not p:
+        return False
+    conn = None
+    try:
+        conn = p.getconn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT call_status, call_duration_seconds
+                FROM public.ai_agent_calls
+                WHERE call_sid = %s
+                LIMIT 1;
+                """,
+                (call_sid,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return False
+            st = str(row[0] or "").lower()
+            dur = int(row[1] or 0)
+            return st == "completed" or dur > 0
+    except Exception:
+        return False
+    finally:
+        if conn and p:
+            try:
+                p.putconn(conn)
+            except Exception:
+                pass
+
+
 @app.post("/call")
-def make_call(request: CallRequest):
+def make_call(
+    request: CallRequest,
+    current_admin: Dict[str, Any] = Depends(require_admin_user),
+):
     auth_id = os.getenv("PLIVO_AUTH_ID")
     auth_token = os.getenv("PLIVO_AUTH_TOKEN")
     from_number = os.getenv("PLIVO_PHONE_NUMBER")
@@ -276,12 +431,80 @@ def make_call(request: CallRequest):
             detail="Plivo credentials, phone number, or PUBLIC_BASE_URL are missing",
         )
 
+    dnc_status = database.is_do_not_call(request.to_number)
+    if dnc_status is True:
+        raise HTTPException(status_code=403, detail="Number is on the do-not-call list")
+    if dnc_status is None:
+        raise HTTPException(status_code=503, detail="Unable to verify do-not-call status; dialling blocked")
+
+    norm_phone = normalize_phone_digits(request.to_number)
+    client = plivo.RestClient(auth_id, auth_token)
+    now_mono = time.monotonic()
+
+    # Prevent duplicate / simultaneous calls to the same phone number
+    existing_to_verify = None
+    with OUTBOUND_DIAL_LOCK:
+        expired = [
+            k for k, v in ACTIVE_OUTBOUND_DIALS.items()
+            if (now_mono - float(v.get("started_at", 0))) > ACTIVE_CALL_GUARD_TTL_SEC
+        ]
+        for k in expired:
+            ACTIVE_OUTBOUND_DIALS.pop(k, None)
+
+        existing = ACTIVE_OUTBOUND_DIALS.get(norm_phone) if norm_phone else None
+        if existing:
+            elapsed = now_mono - float(existing.get("started_at", 0))
+            if existing.get("in_progress") and elapsed < MIN_REDIAL_COOLDOWN_SEC:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Call initiation already in progress for this phone number",
+                )
+            existing_uuid = existing.get("call_uuid")
+            if elapsed < MIN_REDIAL_COOLDOWN_SEC and existing_uuid:
+                return {
+                    "message": "Plivo call already initiated recently (deduplicated)",
+                    "call_uuid": existing_uuid,
+                    "deduplicated": True,
+                }
+            if existing_uuid:
+                existing_to_verify = existing_uuid
+
+    if existing_to_verify:
+        if _is_uuid_active_on_plivo(client, existing_to_verify):
+            return {
+                "message": "Call is still active on Plivo for this number (deduplicated)",
+                "call_uuid": existing_to_verify,
+                "deduplicated": True,
+            }
+        _release_outbound_guard(phone_number=norm_phone, call_uuid=existing_to_verify)
+
+    if norm_phone:
+        with OUTBOUND_DIAL_LOCK:
+            existing = ACTIVE_OUTBOUND_DIALS.get(norm_phone)
+            if existing:
+                elapsed = time.monotonic() - float(existing.get("started_at", 0))
+                if elapsed < MIN_REDIAL_COOLDOWN_SEC:
+                    if existing.get("call_uuid"):
+                        return {
+                            "message": "Plivo call already initiated recently (deduplicated)",
+                            "call_uuid": existing["call_uuid"],
+                            "deduplicated": True,
+                        }
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Call initiation already in progress for this phone number",
+                    )
+            ACTIVE_OUTBOUND_DIALS[norm_phone] = {
+                "started_at": time.monotonic(),
+                "call_uuid": None,
+                "in_progress": True,
+            }
+
     try:
-        client = plivo.RestClient(auth_id, auth_token)
         response = client.calls.create(
             from_=from_number,
             to_=request.to_number,
-            answer_url=f"{base_url}/plivo-stream-answer",
+            answer_url=f"{base_url}/plivo-stream-answer?customer_name={quote(request.customer_name or '')}",
             answer_method="POST",
             ring_url=f"{base_url}/plivo-ring",
             ring_method="POST",
@@ -294,12 +517,24 @@ def make_call(request: CallRequest):
         req_uuid = getattr(response, "request_uuid", None)
         if not req_uuid and isinstance(response, dict):
             req_uuid = response.get("request_uuid")
+        if isinstance(req_uuid, (list, tuple)):
+            req_uuid = req_uuid[0] if req_uuid else None
+
+        if norm_phone:
+            with OUTBOUND_DIAL_LOCK:
+                ACTIVE_OUTBOUND_DIALS[norm_phone] = {
+                    "started_at": time.monotonic(),
+                    "call_uuid": req_uuid,
+                    "in_progress": False,
+                }
         return {
             "message": "Plivo call request submitted",
             "call_uuid": req_uuid,
             "details": str(response),
         }
     except Exception as exc:
+        if norm_phone:
+            _release_outbound_guard(phone_number=norm_phone)
         import traceback
         traceback.print_exc()
         raise HTTPException(
@@ -360,7 +595,7 @@ async def plivo_ring(request: Request):
 async def plivo_call_status(request: Request):
     """
     Webhook called by Plivo for call status updates (busy, no-answer, failed, hangup).
-    Ensures non-connected calls are tracked in PostgreSQL.
+    Ensures non-connected calls are tracked in PostgreSQL without overwriting completed calls.
     """
     try:
         form = dict(await request.form())
@@ -378,9 +613,17 @@ async def plivo_call_status(request: Request):
     if not call_uuid:
         return Response(content="<Response/>", media_type="application/xml")
 
+    if call_status_raw in ("completed", "busy", "no-answer", "failed", "cancel", "hangup") or hangup_cause:
+        _release_outbound_guard(phone_number=to_number, call_uuid=call_uuid)
+
     # If call was not answered or failed (busy, no-answer, rejected, failed, cancel)
     if call_status_raw in ("busy", "no-answer", "failed", "cancel") or hangup_cause in ("USER_BUSY", "NO_ANSWER", "CALL_REJECTED"):
-        if call_status_raw == "busy" or "BUSY" in hangup_cause:
+        already_completed = await asyncio.to_thread(_is_call_completed_in_db, call_uuid)
+        if already_completed:
+            print(f"Skipping non-connected overwrite for already completed CallUUID={call_uuid}")
+            return Response(content="<Response/>", media_type="application/xml")
+
+        if call_status_raw == "busy" or "BUSY" in hangup_cause or "REJECTED" in hangup_cause:
             db_call_status = "failed"
             loan_purpose = f"Customer Busy ({hangup_cause or 'USER_BUSY'})"
             lead_status = "follow_up"
@@ -406,6 +649,7 @@ async def plivo_call_status(request: Request):
                 conversation_history=history,
                 call_status=db_call_status,
                 lead_status=lead_status,
+                loan_type="personal_loan",
                 loan_purpose=loan_purpose,
                 customer_name=None,
             )
@@ -416,26 +660,75 @@ async def plivo_call_status(request: Request):
     return Response(content="<Response/>", media_type="application/xml")
 
 
-def normalize_phone_digits(num: str) -> str:
-    d = "".join([c for c in str(num or "") if c.isdigit()])
-    if len(d) == 10:
-        return "91" + d
-    if d.startswith("0"):
-        return "91" + d[1:]
-    return d
-
-
 class BatchSyncRequest(BaseModel):
     phone_numbers: List[str] = []
     call_uuids: Optional[List[str]] = []
+    call_uuid_by_phone: Optional[Dict[str, str]] = None
+
+
+def _classify_db_rec_outcome(db_rec: Dict[str, Any]) -> tuple[str, Optional[str]]:
+    db_status = (db_rec.get("status") or "").lower()
+    purpose = (db_rec.get("loan_purpose") or "").lower()
+    dur = int(db_rec.get("duration") or 0)
+    conv = db_rec.get("conversation") or []
+    sys_texts = " ".join([
+        m.get("content", "")
+        for m in conv
+        if isinstance(m, dict) and m.get("role") == "system"
+    ]).lower()
+
+    if (
+        dur > 0
+        or db_status == "completed"
+        or "user left" in purpose
+        or "user cut" in purpose
+        or "user left" in sys_texts
+        or "disconnected midway" in sys_texts
+    ):
+        is_user_cut = (
+            "user left" in purpose
+            or "user cut" in purpose
+            or "user left" in sys_texts
+            or "disconnected midway" in sys_texts
+        )
+        is_ai_cut = (
+            "completed normally" in sys_texts
+            or "ai agent completed" in sys_texts
+            or "ai agent cut" in purpose
+            or '"status": "ended"' in sys_texts
+        )
+        cut_by = "user" if is_user_cut else ("ai" if is_ai_cut else "user")
+        return "answered", cut_by
+
+    if "busy" in db_status or "busy" in purpose or "busy" in sys_texts or "rejected" in purpose:
+        return "busy", None
+
+    return "no_answer", None
+
+
+def _is_recent_plivo_end(end_time: Any, max_age_sec: float = 600.0) -> bool:
+    """Only auto-persist missing Plivo Busy/No-Answer CDRs if the call ended very recently (prevents resurrecting deleted historical rows)."""
+    if not end_time:
+        return False
+    try:
+        dt = datetime.fromisoformat(str(end_time).strip().replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - dt).total_seconds()
+        return -60.0 <= age <= max_age_sec
+    except Exception:
+        return False
 
 
 @app.post("/plivo-sync-batch")
-async def plivo_sync_batch(payload: BatchSyncRequest):
+async def plivo_sync_batch(
+    payload: BatchSyncRequest,
+    current_admin: Dict[str, Any] = Depends(require_admin_user),
+):
     """
-    Dynamically checks telecom call status for a batch of phone numbers directly against
-    the Plivo API and PostgreSQL, returning exact outcomes (answered, busy, no_answer, ringing)
-    in real time without waiting for default timeouts.
+    Dynamically checks telecom call status directly against Plivo API and Personal Loan
+    PostgreSQL rows (loan_type='personal_loan' only), preferring exact call_uuid lookups
+    so live calls or answered calls are never confused with older historical busy CDRs.
     """
     auth_id = os.getenv("PLIVO_AUTH_ID")
     auth_token = os.getenv("PLIVO_AUTH_TOKEN")
@@ -444,18 +737,31 @@ async def plivo_sync_batch(payload: BatchSyncRequest):
 
     client = plivo.RestClient(auth_id, auth_token)
 
-    # 1. Fetch live active call UUIDs from Plivo
+    # 1. Fetch live + queued active call UUIDs from Plivo
     live_call_uuids = set()
     try:
         live_res = await asyncio.to_thread(client.calls.live_call_list_ids)
         if isinstance(live_res, dict):
-            live_call_uuids = set(live_res.get("calls", []))
+            live_call_uuids.update(live_res.get("calls", []) or [])
     except Exception as exc:
         print("Error fetching live call list from Plivo:", exc)
 
-    # 2. Query recent calls from PostgreSQL
-    db_calls_by_phone = {}
-    db_calls_by_sid = {}
+    try:
+        queued_res = await asyncio.to_thread(client.calls.queued_call_list_ids)
+        if isinstance(queued_res, dict):
+            live_call_uuids.update(queued_res.get("calls", []) or [])
+    except Exception:
+        pass
+
+    requested_uuids = {
+        str(u).strip()
+        for u in ([*(payload.call_uuids or [])] + list((payload.call_uuid_by_phone or {}).values()))
+        if str(u or "").strip()
+    }
+
+    # 2. Query recent Personal Loan calls strictly from PostgreSQL (never mix home_loan rows)
+    db_calls_by_phone: Dict[str, Dict[str, Any]] = {}
+    db_calls_by_sid: Dict[str, Dict[str, Any]] = {}
     p = get_db_pool()
     if p:
         conn = None
@@ -465,10 +771,24 @@ async def plivo_sync_batch(payload: BatchSyncRequest):
                 cur.execute("""
                     SELECT id, phone_number, call_sid, call_status, call_duration_seconds, loan_purpose, conversation_json, created_at
                     FROM public.ai_agent_calls
+                    WHERE LOWER(COALESCE(loan_type, '')) = 'personal_loan'
                     ORDER BY id DESC
-                    LIMIT 200;
+                    LIMIT 300;
                 """)
-                for row in cur.fetchall():
+                rows = cur.fetchall()
+
+                missing_uuids = [u for u in requested_uuids if all(r[2] != u for r in rows)]
+                if missing_uuids:
+                    cur.execute("""
+                        SELECT id, phone_number, call_sid, call_status, call_duration_seconds, loan_purpose, conversation_json, created_at
+                        FROM public.ai_agent_calls
+                        WHERE LOWER(COALESCE(loan_type, '')) = 'personal_loan'
+                          AND call_sid = ANY(%s)
+                        ORDER BY id DESC;
+                    """, (missing_uuids,))
+                    rows = list(rows) + list(cur.fetchall())
+
+                for row in rows:
                     cid, phone, sid, status, dur, purpose, conv, created = row
                     norm_p = normalize_phone_digits(phone)
                     rec = {
@@ -485,7 +805,7 @@ async def plivo_sync_batch(payload: BatchSyncRequest):
                     if sid and sid not in db_calls_by_sid:
                         db_calls_by_sid[sid] = rec
         except Exception as exc:
-            print("Error querying recent DB calls:", exc)
+            print("Error querying recent Personal Loan DB calls:", exc)
         finally:
             if conn and p:
                 try:
@@ -493,63 +813,125 @@ async def plivo_sync_batch(payload: BatchSyncRequest):
                 except Exception:
                     pass
 
-    # 3. Query recent calls from Plivo (limit=20)
-    plivo_calls_map = {}
+    # 3. Query recent calls from Plivo (limit=20) indexed by BOTH call_uuid and to_number
+    plivo_calls_map: Dict[str, Any] = {}
+    plivo_calls_by_uuid: Dict[str, Any] = {}
     try:
         recent_plivo = await asyncio.to_thread(client.calls.list, limit=20)
         c_list = getattr(recent_plivo, "objects", recent_plivo) if not isinstance(recent_plivo, list) else recent_plivo
         for c in c_list:
+            c_uid = getattr(c, "call_uuid", None)
+            if c_uid and c_uid not in plivo_calls_by_uuid:
+                plivo_calls_by_uuid[c_uid] = c
             to_n = normalize_phone_digits(getattr(c, "to_number", ""))
             if to_n and to_n not in plivo_calls_map:
                 plivo_calls_map[to_n] = c
     except Exception as exc:
         print("Error fetching recent Plivo calls:", exc)
 
+    uuid_map_req = payload.call_uuid_by_phone or {}
     results = {}
-    for raw_phone in payload.phone_numbers:
+
+    for idx, raw_phone in enumerate(payload.phone_numbers):
         norm_phone = normalize_phone_digits(raw_phone)
-        c_plivo = plivo_calls_map.get(norm_phone)
+        target_uuid = (
+            uuid_map_req.get(raw_phone)
+            or uuid_map_req.get(norm_phone)
+            or (
+                payload.call_uuids[idx]
+                if payload.call_uuids
+                and len(payload.call_uuids) == len(payload.phone_numbers)
+                and idx < len(payload.call_uuids)
+                else ""
+            )
+            or ""
+        ).strip()
 
-        # If not in the recent 20, look up by number in Plivo
-        if not c_plivo and norm_phone:
-            try:
-                single_res = await asyncio.to_thread(client.calls.list, to_number=norm_phone, limit=1)
-                s_list = getattr(single_res, "objects", single_res) if not isinstance(single_res, list) else single_res
-                if s_list:
-                    c_plivo = s_list[0]
-                    plivo_calls_map[norm_phone] = c_plivo
-            except Exception:
-                pass
+        if target_uuid:
+            # Exact UUID path: never match an older unrelated CDR or unrelated DB row
+            if target_uuid in live_call_uuids:
+                results[raw_phone] = {
+                    "status": "ringing",
+                    "category": "ringing",
+                    "isLive": True,
+                    "callSid": target_uuid,
+                    "duration": 0,
+                }
+                continue
 
-        db_rec = db_calls_by_phone.get(norm_phone)
-        uuid = getattr(c_plivo, "call_uuid", "") if c_plivo else (db_rec.get("call_sid", "") if db_rec else "")
+            db_rec = db_calls_by_sid.get(target_uuid)
+            c_plivo = plivo_calls_by_uuid.get(target_uuid)
+            if not c_plivo:
+                try:
+                    c_plivo = await asyncio.to_thread(client.calls.get, call_uuid=target_uuid)
+                except Exception:
+                    c_plivo = None
 
-        # Check if call is currently actively ringing on Plivo
-        if uuid and uuid in live_call_uuids:
-            results[raw_phone] = {
-                "status": "ringing",
-                "category": "ringing",
-                "isLive": True,
-                "callSid": uuid,
-                "duration": 0,
-            }
-            continue
+            uuid = target_uuid
+            if not c_plivo and not db_rec:
+                # Call was just submitted or CDR not finalized yet — keep ringing instead of pulling older Busy CDR
+                results[raw_phone] = {
+                    "status": "ringing",
+                    "category": "ringing",
+                    "isLive": True,
+                    "callSid": target_uuid,
+                    "duration": 0,
+                }
+                continue
+        else:
+            c_plivo = plivo_calls_map.get(norm_phone)
+            if not c_plivo and norm_phone:
+                try:
+                    single_res = await asyncio.to_thread(client.calls.list, to_number=norm_phone, limit=1)
+                    s_list = getattr(single_res, "objects", single_res) if not isinstance(single_res, list) else single_res
+                    if s_list:
+                        c_plivo = s_list[0]
+                        plivo_calls_map[norm_phone] = c_plivo
+                except Exception:
+                    pass
 
-        # If we have a Plivo record:
+            plivo_uuid = getattr(c_plivo, "call_uuid", "") if c_plivo else ""
+            if plivo_uuid:
+                db_rec = db_calls_by_sid.get(plivo_uuid)
+                uuid = plivo_uuid
+            else:
+                db_rec = db_calls_by_phone.get(norm_phone)
+                uuid = db_rec.get("call_sid", "") if db_rec else ""
+
+            if uuid and uuid in live_call_uuids:
+                results[raw_phone] = {
+                    "status": "ringing",
+                    "category": "ringing",
+                    "isLive": True,
+                    "callSid": uuid,
+                    "duration": 0,
+                }
+                continue
+
         if c_plivo:
             state = getattr(c_plivo, "call_state", None) or ""
             cause = getattr(c_plivo, "hangup_cause_name", None) or ""
             dur = int(getattr(c_plivo, "call_duration", 0) or 0)
             source = getattr(c_plivo, "hangup_source", None) or ""
+            end_time = getattr(c_plivo, "end_time", None)
 
-            if state == "ANSWER" or dur > 0:
+            db_dur = int(db_rec.get("duration") or 0) if db_rec else 0
+            db_status = (db_rec.get("status") or "").lower() if db_rec else ""
+
+            if state == "ANSWER" or dur > 0 or db_status == "completed" or db_dur > 0:
                 cat = "answered"
-                cut_by = "user" if source == "Callee" else "ai"
-            elif cause in ("Rejected", "Busy Line", "User Busy") or "busy" in cause.lower():
+                if db_rec:
+                    _, db_cut_by = _classify_db_rec_outcome(db_rec)
+                    cut_by = "user" if (source == "Callee" or db_cut_by == "user") else "ai"
+                else:
+                    cut_by = "user" if source == "Callee" else "ai"
+            elif state in ("RINGING", "IN_PROGRESS", "QUEUED") or (not end_time and not cause):
+                cat = "ringing"
+                cut_by = None
+            elif cause in ("Rejected", "Busy Line", "User Busy") or "busy" in cause.lower() or "reject" in cause.lower():
                 cat = "busy"
                 cut_by = None
-                # Ensure saved to DB if not already present
-                if not db_rec:
+                if not db_rec and uuid and _is_recent_plivo_end(end_time):
                     try:
                         await asyncio.to_thread(
                             save_call_record,
@@ -558,18 +940,16 @@ async def plivo_sync_batch(payload: BatchSyncRequest):
                             conversation_history=[{"role": "system", "content": f"Plivo Call Status: BUSY ({cause})"}],
                             call_status="failed",
                             lead_status="follow_up",
+                            loan_type="personal_loan",
                             loan_purpose=f"Customer Busy ({cause})",
                             customer_name=None,
                         )
                     except Exception:
                         pass
-            elif state in ("RINGING", "IN_PROGRESS", "QUEUED"):
-                cat = "ringing"
-                cut_by = None
             else:
                 cat = "no_answer"
                 cut_by = None
-                if not db_rec:
+                if not db_rec and uuid and _is_recent_plivo_end(end_time):
                     try:
                         await asyncio.to_thread(
                             save_call_record,
@@ -578,6 +958,7 @@ async def plivo_sync_batch(payload: BatchSyncRequest):
                             conversation_history=[{"role": "system", "content": f"Plivo Call Status: NO-ANSWER ({cause})"}],
                             call_status="no_answer",
                             lead_status="follow_up",
+                            loan_type="personal_loan",
                             loan_purpose=f"No Answer ({cause})",
                             customer_name=None,
                         )
@@ -588,37 +969,21 @@ async def plivo_sync_batch(payload: BatchSyncRequest):
                 "status": cat,
                 "category": cat,
                 "cutBy": cut_by,
-                "duration": dur if dur > 0 else (db_rec.get("duration", 0) if db_rec else 0),
+                "duration": dur if dur > 0 else db_dur,
                 "hangupCause": cause,
                 "hangupSource": source,
                 "callSid": uuid,
                 "dbId": db_rec.get("id") if db_rec else None,
             }
         elif db_rec:
-            # Use DB record
-            db_status = (db_rec.get("status") or "").lower()
-            purpose = (db_rec.get("loan_purpose") or "").lower()
-            dur = db_rec.get("duration") or 0
-            conv = db_rec.get("conversation") or []
-            sys_texts = " ".join([m.get("content", "") for m in conv if isinstance(m, dict) and m.get("role") == "system"]).lower()
-
-            if "busy" in db_status or "busy" in purpose or "busy" in sys_texts:
-                cat = "busy"
-                cut_by = None
-            elif dur > 0 or db_status == "completed":
-                cat = "answered"
-                cut_by = "ai" if ("call completed normally" in sys_texts or "ai_completed" in sys_texts) else "user"
-            else:
-                cat = "no_answer"
-                cut_by = None
-
+            cat, cut_by = _classify_db_rec_outcome(db_rec)
             results[raw_phone] = {
                 "status": cat,
                 "category": cat,
                 "cutBy": cut_by,
-                "duration": dur,
+                "duration": db_rec.get("duration") or 0,
                 "dbId": db_rec.get("id"),
-                "callSid": db_rec.get("call_sid"),
+                "callSid": db_rec.get("call_sid") or uuid,
             }
         else:
             results[raw_phone] = {
@@ -630,7 +995,10 @@ async def plivo_sync_batch(payload: BatchSyncRequest):
 
 
 @app.api_route("/call-status", methods=["GET", "POST"])
-async def get_single_call_status(request: Request):
+async def get_single_call_status(
+    request: Request,
+    current_admin: Dict[str, Any] = Depends(require_admin_user),
+):
     """Dynamically get status for a single phone call or call_uuid."""
     phone = request.query_params.get("phone") or request.query_params.get("phone_number") or ""
     call_uuid = request.query_params.get("call_uuid") or request.query_params.get("CallUUID") or ""
@@ -642,9 +1010,13 @@ async def get_single_call_status(request: Request):
         except Exception:
             pass
 
-    sync_req = BatchSyncRequest(phone_numbers=[phone] if phone else [], call_uuids=[call_uuid] if call_uuid else [])
-    res = await plivo_sync_batch(sync_req)
-    st = res.get("statuses", {}).get(phone, {})
+    key_phone = phone or call_uuid
+    sync_req = BatchSyncRequest(
+        phone_numbers=[key_phone] if key_phone else [],
+        call_uuids=[call_uuid] if call_uuid else [],
+    )
+    res = await plivo_sync_batch(sync_req, current_admin=current_admin)
+    st = res.get("statuses", {}).get(key_phone, {})
     return st
 
 
@@ -675,17 +1047,32 @@ async def plivo_stream_answer(request: Request):
     if not from_number:
         from_number = request.query_params.get("From") or request.query_params.get("from_number") or ""
 
-    phone = to_number or from_number
-    if call_uuid and phone:
-        ACTIVE_CALL_METADATA[call_uuid] = {
-            "phone_number": phone,
-            "started_at": datetime.now(timezone.utc),
-        }
-    elif phone:
-        ACTIVE_CALL_METADATA["latest"] = {
-            "phone_number": phone,
-            "started_at": datetime.now(timezone.utc),
-        }
+    # Outbound call: From = our Plivo number, To = customer.
+    # Customer return/inbound call: To = our Plivo number, From = customer.
+    plivo_number = normalize_phone_digits(os.getenv("PLIVO_PHONE_NUMBER", ""))
+    normalized_to = normalize_phone_digits(to_number)
+    normalized_from = normalize_phone_digits(from_number)
+
+    is_customer_return_call = bool(
+        plivo_number
+        and normalized_to == plivo_number
+        and normalized_from
+        and normalized_from != plivo_number
+    )
+
+    phone = from_number if is_customer_return_call else (to_number or from_number)
+    call_meta = {
+        "phone_number": phone,
+        "customer_name": request.query_params.get("customer_name", ""),
+        "started_at": datetime.now(timezone.utc),
+        "is_customer_return_call": is_customer_return_call,
+    }
+
+    if call_uuid:
+        ACTIVE_CALL_METADATA[call_uuid] = call_meta
+    if phone:
+        ACTIVE_CALL_METADATA[phone] = call_meta
+    ACTIVE_CALL_METADATA["latest"] = call_meta
 
     ws_url = "wss://" + base_url.removeprefix("https://") + "/plivo-audio-stream"
 
@@ -705,12 +1092,9 @@ async def plivo_answer(request: Request):
     import xml.sax.saxutils as saxutils
     try:
         base_url = get_base_url()
-        greeting_text = (
-            "గుడ్ మార్నింగ్ అండి! నేను పర్సనల్ లోన్ డిపార్ట్మెంట్ నుండి స్నేహని మాట్లాడుతున్నాను. "
-            "ఐసీఐసీఐ బ్యాంక్ పర్సనల్ లోన్ గురించి కాల్ చేస్తున్నాను. మీకు పర్సనల్ లోన్ అవసరమా?"
-        )
-        audio_filename = "opening_greeting_te.wav"
-        make_sarvam_audio(greeting_text, audio_filename, language="te", audio_dir=AUDIO_DIR)
+        greeting_text = get_personal_loan_opening_text()
+        audio_filename = "opening_greeting_en.wav"
+        make_sarvam_audio(greeting_text, audio_filename, language="en", audio_dir=AUDIO_DIR)
         audio_url = saxutils.escape(f"{base_url}/reply/{audio_filename}")
         xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -750,10 +1134,10 @@ async def plivo_timeout(request: Request):
     state["silence_count"] = silence_count
 
     if silence_count >= 2:
-        farewell = "Thank you for your time. Have a nice day."
+        farewell = ("Thank you for your time. Goodbye." if (state.get("flow") or CallFlow()).language == "en" else "మీ సమయానికి ధన్యవాదాలు అండి. నమస్కారం!")
         try:
             filename = f"{uuid.uuid4().hex}.wav"
-            make_sarvam_audio(farewell, filename, language="en", audio_dir=AUDIO_DIR)
+            make_sarvam_audio(farewell, filename, language=(state.get("flow") or CallFlow()).language, audio_dir=AUDIO_DIR)
             audio_url = saxutils.escape(f"{base_url}/reply/{filename}")
             xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -768,12 +1152,13 @@ async def plivo_timeout(request: Request):
 </Response>"""
         return Response(content=xml, media_type="application/xml")
 
-    current_q = state.get("current_question", "Are you looking for a personal loan?")
-    reminder = f"I'm sorry, I didn't hear anything. {current_q}"
+    flow = state.get("flow") or CallFlow()
+    current_q = state.get("current_question") or question(flow)
+    reminder = (("Sorry, I couldn't hear you. " if flow.language == "en" else "క్షమించండి అండి, వినిపించలేదు. ") + current_q)
 
     try:
         filename = f"{uuid.uuid4().hex}.wav"
-        make_sarvam_audio(reminder, filename, language="en", audio_dir=AUDIO_DIR)
+        make_sarvam_audio(reminder, filename, language="te", audio_dir=AUDIO_DIR)
         audio_url = saxutils.escape(f"{base_url}/reply/{filename}")
         xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -802,72 +1187,7 @@ async def plivo_timeout(request: Request):
 
 @app.api_route("/plivo-process-speech", methods=["GET", "POST"])
 async def plivo_process_speech(request: Request):
-    import xml.sax.saxutils as saxutils
-    base_url = get_base_url()
-    if not base_url:
-        raise HTTPException(status_code=500, detail="PUBLIC_BASE_URL is missing")
-
-    form_data = dict(await request.form())
-    customer_text = (
-        form_data.get("SpeechResult")
-        or form_data.get("Speech")
-        or form_data.get("speech_result")
-        or request.query_params.get("SpeechResult")
-        or ""
-    ).strip()
-
-    call_sid = (
-        form_data.get("CallUUID")
-        or form_data.get("call_uuid")
-        or request.query_params.get("CallUUID")
-        or "unknown"
-    )
-
-    state = CALL_STATE.setdefault(call_sid, {"messages": []})
-    state["silence_count"] = 0
-
-    if not customer_text:
-        return await plivo_timeout(request)
-
-    state["messages"].append({"role": "user", "content": customer_text})
-    state["messages"] = state["messages"][-14:]
-
-    messages_payload = [
-        {"role": "system", "content": SYSTEM_PROMPT + "\n\n" + TELUGU_LANGUAGE_INSTRUCTION},
-        *state["messages"],
-    ]
-
-    try:
-        reply_text = generate_sync_chat_reply(messages_payload, max_tokens=100)
-    except Exception:
-        reply_text = "సరే అండి, మీ ఆన్సర్ ఇంకోసారి చెప్పగలరా?"
-
-    reply_text = extract_single_question(reply_text)
-    state["messages"].append({"role": "assistant", "content": reply_text})
-
-    filename = f"{uuid.uuid4().hex}.wav"
-    make_sarvam_audio(reply_text, filename, language="te", audio_dir=AUDIO_DIR)
-    reply_audio_url = saxutils.escape(f"{base_url}/reply/{filename}")
-
-    if is_closing_reply(reply_text):
-        xml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Play>{reply_audio_url}</Play>
-    <Hangup/>
-</Response>"""
-        return Response(content=xml, media_type="application/xml")
-
-    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <GetInput inputType="speech"
-              action="{base_url}/plivo-process-speech"
-              method="POST"
-              executionTimeout="30">
-        <Play>{reply_audio_url}</Play>
-    </GetInput>
-    <Redirect method="POST">{base_url}/plivo-timeout</Redirect>
-</Response>"""
-    return Response(content=xml, media_type="application/xml")
+    return await _http_speech_route(request, "/plivo-process-speech")
 
 
 @app.post("/test-language-detection")
@@ -912,6 +1232,7 @@ async def plivo_audio_stream(websocket: WebSocket):
 
     call_sid = None
     phone_number = None
+    is_customer_return_call = False
     call_started_at = datetime.now(timezone.utc)
     stream_ended_normally = False
     saved_to_db = False
@@ -919,11 +1240,10 @@ async def plivo_audio_stream(websocket: WebSocket):
     call_audio_path = None
     ai_speaking_until = 0.0
     is_processing_turn = False
-    call_language: Optional[str] = "en"  # Starts in English by default
-    silence_prompt_stage = 0  # 0: waiting for first response, 1: reminder played, 2: terminating
-    last_interaction_time = time.time()
-    opening_already_spoken = False
-    silence_task = None
+    flow_state = CallFlow(language="en")  # purpose -> permission -> salaried check -> branch questions
+    call_language: Optional[str] = "en"
+    last_final_transcript = ""
+    last_final_transcript_at = 0.0
 
     def is_ai_active():
         return is_processing_turn or (time.time() < ai_speaking_until)
@@ -942,6 +1262,7 @@ async def plivo_audio_stream(websocket: WebSocket):
 
             async def receive_sarvam_results():
                 nonlocal stream_ended_normally, saved_to_db, ai_speaking_until, is_processing_turn, call_language
+                nonlocal last_final_transcript, last_final_transcript_at
                 try:
                     while True:
                         event = await sarvam_socket.recv()
@@ -950,25 +1271,30 @@ async def plivo_audio_stream(websocket: WebSocket):
                         if event_type == "transcript.partial":
                             if not is_ai_active():
                                 print("Partial:", event.text)
-                                if (event.text or "").strip():
-                                    last_interaction_time = time.time()
 
                         elif event_type == "transcript.final":
-                            # Only ignore transcript if AI is still processing turn or in the middle of speech (allow 0.2s tail buffer)
-                            if is_processing_turn or (time.time() < (ai_speaking_until - 0.2)):
-                                print(f"[IGNORING MID-SPEECH] Customer audio arrived during AI speech ('{event.text}')")
+                            if is_ai_active():
+                                # Customer audio arrived while AI was thinking or speaking: ignore
                                 continue
 
                             customer_text = (event.text or "").strip()
-                            # Normalize common Hindi STT outputs (like कंपनी -> company) since agent is English/Telugu only
-                            customer_text = normalize_hindi_stt(customer_text)
                             detected_language = getattr(event, "language", None)
                             if not customer_text or customer_text.strip(" .,!?:;") == "":
                                 continue
 
-                            # Customer spoke: reset silence watchdog timer and stage
-                            silence_prompt_stage = 0
-                            last_interaction_time = time.time()
+                            # Sarvam can emit the same final event more than once.
+                            # Avoid processing a duplicate utterance twice, especially
+                            # when a TTS failure leaves no playback window for
+                            # is_ai_active() to suppress it.
+                            now = time.monotonic()
+                            transcript_key = " ".join(customer_text.casefold().split())
+                            if (transcript_key == last_final_transcript
+                                    and now - last_final_transcript_at < 3.0):
+                                print("[STT] Ignoring duplicate final transcript:", customer_text)
+                                continue
+                            last_final_transcript = transcript_key
+                            last_final_transcript_at = now
+
                             is_processing_turn = True
 
                             print(
@@ -990,292 +1316,28 @@ async def plivo_audio_stream(websocket: WebSocket):
                             #    lock the call language.
                             # --------------------------------------------------
                             if is_recording_announcement(customer_text):
-                                tts_language = call_language or "te"
-                                reply_text = get_recording_followup(tts_language)
-                                print("[SYSTEM AUDIO] Recording announcement ignored.")
-                                print("AI REPLY:", reply_text)
-
-                                try:
-                                    audio_bytes = await asyncio.to_thread(
-                                        synthesize_sarvam_speech,
-                                        reply_text,
-                                        tts_language,
-                                    )
-                                    if audio_bytes:
-                                        if call_audio_path:
-                                            with open(call_audio_path, "ab") as f:
-                                                f.write(audio_bytes)
-                                        audio_base64 = base64.b64encode(audio_bytes).decode("ascii")
-                                        await send_audio_to_plivo(websocket, audio_base64)
-                                        ai_speaking_until = time.time() + (len(audio_bytes) / 8000.0)
-                                finally:
-                                    is_processing_turn = False
+                                print("[SYSTEM AUDIO] Ignoring recording announcement; keeping current question and language.")
+                                is_processing_turn = False
                                 continue
 
-                            # --------------------------------------------------
-                            # 2) Language Management & Switching
-                            #    Rules:
-                            #    - Starting language is English (en)
-                            #    - eng to tel (e to t): Auto-switches to Telugu whenever customer speaks Telugu
-                            #    - tel to eng: CANNOT switch to English automatically. ONLY if customer explicitly asks to speak in English.
-                            # --------------------------------------------------
-                            requested_language = detect_explicit_language_switch(customer_text)
-
-                            if call_language == "en" or call_language is None:
-                                # Agent is currently speaking English
-                                # Auto-switch to Telugu if customer speaks Telugu OR explicitly asks for Telugu:
-                                if requested_language == "te" or is_telugu_speech(customer_text, detected_language):
-                                    call_language = "te"
-                                    print(f"[LANGUAGE] Customer spoke Telugu. Auto-switched from English to Telugu (e to t). Input: '{customer_text}'")
-                                elif requested_language == "en":
-                                    call_language = "en"
-                                else:
-                                    call_language = "en"
-                                    # Otherwise stay in English!
-
-                            elif call_language == "te":
-                                # Agent is currently speaking Telugu
-                                # Rule: Once in Telugu, CANNOT switch to English automatically!
-                                # ONLY switch if customer explicitly requests English:
-                                if requested_language == "en":
-                                    call_language = "en"
-                                    print(f"[LANGUAGE] Customer explicitly requested English. Switched to: en. Input: '{customer_text}'")
-                                # Otherwise STAY in Telugu! (Loan terms like HDFC, salary, EMI do NOT switch)
-
-                            tts_language = call_language
-
+                            # 2) Deterministic personal-loan questions: skip the 1500-line prompt.
+                            # OpenAI only handles genuinely ambiguous answers/questions.
                             try:
                                 if not conversation_history:
-                                    conversation_history.append({
-                                        "role": "assistant",
-                                        "content": get_opening_text("en"),
-                                    })
-
-                                conversation_history.append({
-                                    "role": "user",
-                                    "content": customer_text,
-                                })
-
-                                language_instruction = (
-                                    ENGLISH_LANGUAGE_INSTRUCTION
-                                    if call_language == "en"
-                                    else TELUGU_LANGUAGE_INSTRUCTION
+                                    conversation_history.append({"role": "assistant", "content": opening(flow_state)})
+                                turn = await process_flow_turn(
+                                    flow_state, customer_text, call_sid or "unknown",
+                                    phone_number, conversation_history, call_started_at,
+                                    detected_language,
                                 )
-
-                                runtime_context = (
-                                    "\n\nRUNTIME_CONTEXT:\n"
-                                    f"CALL_LANGUAGE = {'ENGLISH' if call_language == 'en' else 'TELUGU'}\n"
-                                    f"STRICT_LANGUAGE_MODE = {'REPLY ONLY IN ENGLISH' if call_language == 'en' else 'REPLY ONLY IN TELUGU'}\n"
-                                    "LANGUAGE_LOCKED = true\n"
-                                )
-
-                                messages_payload = [
-                                    {
-                                        "role": "system",
-                                        "content": (
-                                            SYSTEM_PROMPT
-                                            + "\n\n"
-                                            + language_instruction
-                                            + runtime_context
-                                        ),
-                                    },
-                                    *conversation_history[-14:],
-                                ]
-
-                                # Determine previous assistant context:
-                                last_asst_msg = ""
-                                for m in reversed(conversation_history[:-1]):
-                                    if m.get("role") == "assistant":
-                                        last_asst_msg = m.get("content", "").lower()
-                                        break
-
-                                is_eligibility_context = any(kw in last_asst_msg for kw in (
-                                    "eligibility", "check your eligibility", "check", "ఎలిజిబిలిటీ",
-                                    "need a personal loan", "need a loan", "పర్సనల్ లోన్ అవసరమా",
-                                    "yes చెప్పండి", "yes or no", "do you need"
-                                ))
-
-                                is_continuation = is_continuation_response(customer_text) or detect_yes(customer_text)
-
-                                # Check if job/business has already been discussed in history:
-                                job_already_asked = any(
-                                    ("job" in m.get("content", "").lower() or "జాబ్" in m.get("content", "").lower() or "business" in m.get("content", "").lower() or "బిజినెస్" in m.get("content", "").lower())
-                                    for m in conversation_history
-                                )
-
-                                # Check if loan offer (1 lakh to 1 crore at 9.99% to 18%) was already pitched:
-                                offer_already_pitched = any(
-                                    ("1 lakh" in m.get("content", "").lower() or "1 లక్ష" in m.get("content", "").lower() or "9.99%" in m.get("content", "").lower() or "nine point" in m.get("content", "").lower())
-                                    for m in conversation_history
-                                    if m.get("role") == "assistant"
-                                )
-
-                                is_callback_closing = False
-                                # Check if previous turn was callback time question:
-                                if is_callback_time_query(last_asst_msg):
-                                    print(f"[CALLBACK TIME ANSWER] Customer replied to callback time question: '{customer_text}'")
-                                    is_callback_closing = True
-                                    if detect_no(customer_text) or any(w in customer_text.lower() for w in ("no callback", "call cheyoddu", "oddu", "vaddu", "వద్దు")):
-                                        if call_language == "en":
-                                            reply_text = "Okay, thank you for your time. Have a great day!"
-                                        else:
-                                            reply_text = "సరే అండి, మీ సమయానికి ధన్యవాదాలు. హావ్ ఏ గ్రేట్ డే!"
-                                    else:
-                                        if call_language == "en":
-                                            reply_text = "Thank you! Our executive will call you at that time. Have a nice day!"
-                                        else:
-                                            reply_text = "థాంక్యూ అండి! ఆ సమయానికి మా ఎగ్జిక్యూటివ్ మీకు కాల్ చేస్తారు. హావ్ ఏ నైస్ డే!"
-
-                                # 1. Confusion / Identity / Purpose Query ("What are you talking about?", "Who is this?", "Why did you call?"):
-                                elif is_confusion_or_identity_query(customer_text):
-                                    print(f"[CONFUSION / IDENTITY] Customer asked: '{customer_text}'. Clarifying loan department offer.")
-                                    if call_language == "en":
-                                        reply_text = "I am Sneha calling from the personal loan department. We provide personal loans from 1 lakh to 1 crore at interest rates from 9.99% to 18%. Do you need a personal loan?"
-                                    else:
-                                        reply_text = "నేను పర్సనల్ లోన్ డిపార్ట్‌మెంట్ నుండి స్నేహ మాట్లాడుతున్నాను అండి. మేము 9.99% నుండి 18% వడ్డీ రేటుతో 1 లక్ష నుండి 1 కోటి వరకు పర్సనల్ లోన్స్ అందిస్తున్నాము. మీకు పర్సనల్ లోన్ అవసరమా అండి?"
-
-                                # 2. Explicit Call End Request / DNC:
-                                elif detect_end_request(customer_text):
-                                    print(f"[END REQUEST] Customer requested end call ('{customer_text}'). Ending call.")
-                                    if call_language == "en":
-                                        reply_text = "Okay, thank you for your time. Have a nice day!"
-                                    else:
-                                        reply_text = "సరే అండి, మీ సమయానికి ధన్యవాదాలు. హావ్ ఏ నైస్ డే!"
-
-                                # 3. Customer Asks About Interest Rate / Loan Details ("interate", "interest rate", "vaddi entha", "loan details"):
-                                elif is_interest_rate_or_details_query(customer_text) and not job_already_asked:
-                                    print(f"[INTEREST RATE / DETAILS] Customer asked interest rate / details ('{customer_text}'). Pitching terms.")
-                                    if call_language == "en":
-                                        reply_text = "We provide personal loans from 1 lakh to 1 crore at interest rates from 9.99% to 18%. Do you need a personal loan?"
-                                    else:
-                                        reply_text = "మేము 9.99% నుండి 18% వడ్డీ రేటుతో 1 లక్ష నుండి 1 కోటి వరకు పర్సనల్ లోన్స్ అందిస్తున్నాము. మీకు పర్సనల్ లోన్ అవసరమా అండి?"
-
-                                # 4. Human Agent / Callback Request / Busy / Call Later:
-                                elif is_human_agent_or_callback_request(customer_text) and not is_confusion_or_identity_query(customer_text) and not is_interest_rate_or_details_query(customer_text):
-                                    print(f"[HUMAN AGENT / CALLBACK REQUEST] Customer requested callback or human agent ('{customer_text}'). Asking convenient day/time.")
-                                    if call_language == "en":
-                                        reply_text = "On which day and at what time would it be convenient for our executive to call you?"
-                                    else:
-                                        reply_text = "మా ఎగ్జిక్యూటివ్ మీకు కాల్ చేయడానికి ఏ రోజు, ఏ టైమ్ మీకు కన్వీనియంట్‌గా ఉంటుంది అండి?"
-
-                                # 5. Customer says NO / NOT INTERESTED:
-                                elif detect_no(customer_text):
-                                    if not offer_already_pitched and (len(conversation_history) <= 3 or is_eligibility_context):
-                                        print(f"[INITIAL NO] Customer said no to opening ('{customer_text}'). Pitching loan offer before closing.")
-                                        if call_language == "en":
-                                            reply_text = "We provide personal loans from 1 lakh to 1 crore at interest rates from 9.99% to 18%. Do you need a personal loan?"
-                                        else:
-                                            reply_text = "మేము 9.99% నుండి 18% వడ్డీ రేటుతో 1 లక్ష నుండి 1 కోటి వరకు పర్సనల్ లోన్స్ అందిస్తున్నాము. మీకు పర్సనల్ లోన్ అవసరమా అండి?"
-                                    else:
-                                        print(f"[LOAN DECLINED] Customer declined loan ('{customer_text}'). Ending call.")
-                                        if call_language == "en":
-                                            reply_text = "Okay, thank you for your time. Have a nice day!"
-                                        else:
-                                            reply_text = "సరే అండి, మీ సమయానికి ధన్యవాదాలు. హావ్ ఏ నైస్ డే!"
-
-                                # 6. Customer requests repeat / says didn't understand ("malli cheppandi", "repeat", "artham kale"):
-                                elif is_repeat_or_clarification_query(customer_text):
-                                    print(f"[REPEAT / CLARIFICATION] Customer requested repeat ('{customer_text}').")
-                                    if not job_already_asked:
-                                        if offer_already_pitched:
-                                            if call_language == "en":
-                                                reply_text = "We provide personal loans from 1 lakh to 1 crore at interest rates from 9.99% to 18%. Do you need a personal loan?"
-                                            else:
-                                                reply_text = "మేము 9.99% నుండి 18% వడ్డీ రేటుతో 1 లక్ష నుండి 1 కోటి వరకు పర్సనల్ లోన్స్ అందిస్తున్నాము. మీకు పర్సనల్ లోన్ అవసరమా అండి?"
-                                        else:
-                                            if call_language == "en":
-                                                reply_text = "This is Sneha from the personal loan department. I’m calling regarding ICICI Bank personal loans. Do you need a personal loan?"
-                                            else:
-                                                reply_text = "నేను పర్సనల్ లోన్ డిపార్ట్మెంట్ నుండి స్నేహని మాట్లాడుతున్నాను. ఐసీఐసీఐ బ్యాంక్ పర్సనల్ లోన్ గురించి కాల్ చేస్తున్నాను. మీకు పర్సనల్ లోన్ అవసరమా?"
-                                    else:
-                                        reply_text = await generate_chat_reply(messages_payload, max_tokens=60)
-
-                                # 7. Unemployed / No Work:
-                                elif is_unemployed_response(customer_text):
-                                    print("Customer identified as unemployed / no business. Ending call politely.")
-                                    if call_language == "en":
-                                        reply_text = "Thank you for your time. Have a great day!"
-                                    else:
-                                        reply_text = "సరే అండి, మీ విలువైన సమయానికి ధన్యవాదాలు. హావ్ ఏ నైస్ డే!"
-
-                                # 8. Customer answers "Company" to Job or Business question:
-                                elif is_company_response(customer_text) and any(w in last_asst_msg for w in ("job", "business", "జాబ్", "బిజినెస్", "చేస్తున్నారా")):
-                                    print(f"[COMPANY RESPONSE] Customer answered company ('{customer_text}'). Asking employee vs own company.")
-                                    if call_language == "en":
-                                        reply_text = "Are you working in a company as an employee, or is it your own company?"
-                                    else:
-                                        reply_text = "మీరు కంపెనీలో జాబ్ చేస్తున్నారా లేదా అది మీ సొంత కంపెనీనా అండి?"
-
-                                # 9. Customer clarifying employee vs own company:
-                                elif any(w in last_asst_msg for w in ("working in a company", "own company", "సొంత కంపెనీ", "కంపెనీలో జాబ్")):
-                                    c_low = customer_text.lower()
-                                    if any(w in c_low for w in (
-                                        "work", "working", "employee", "job", "private", "pvt", "in a company",
-                                        "menu", "me no", "me", "nenu", "neenu", "nene", "nenandi", "నేను", "నేనండి",
-                                        "జాబ్", "వర్క్", "ఉద్యోగం", "చేస్తున్నా", "చేస్తున్నాను", "వర్కింగ్"
-                                    )):
-                                        print(f"[EMPLOYMENT CLARIFIED] Customer confirmed salaried employee ('{customer_text}'). Asking company name.")
-                                        if call_language == "en":
-                                            reply_text = "Which company are you working in?"
-                                        else:
-                                            reply_text = "మీరు ఏ కంపెనీలో వర్క్ చేస్తున్నారు అండి?"
-                                    elif any(w in c_low for w in ("own", "my own", "mine", "business", "owner", "proprietor", "సొంత", "బిజినెస్")):
-                                        print(f"[EMPLOYMENT CLARIFIED] Customer confirmed own company / business ('{customer_text}'). Asking business type.")
-                                        if call_language == "en":
-                                            reply_text = "What is the nature of your business?"
-                                        else:
-                                            reply_text = "మీది ఏ విధమైన బిజినెస్ అండి?"
-                                    else:
-                                        reply_text = await generate_chat_reply(messages_payload, max_tokens=60)
-
-                                # 10. Customer confirms or says continuation words (e.g. 'click', 'check', 'continue', 'forward', 'formward', 'proceed', 'yes', 'sure', 'tell me', etc.):
-                                elif is_continuation and (not job_already_asked or is_eligibility_context or len(conversation_history) <= 4):
-                                    print(f"[CONTINUATION DETECTED] Customer confirmed continuation ('{customer_text}'). Asking job/business.")
-                                    if call_language == "en":
-                                        reply_text = "Are you doing a job or business?"
-                                    else:
-                                        reply_text = "సరే అండి! మీరు ప్రస్తుతం జాబ్ చేస్తున్నారా లేదా బిజినెస్ చేస్తున్నారా?"
-
-                                else:
-                                    reply_text = await generate_chat_reply(messages_payload, max_tokens=60)
-                                    # Fallback safety: If OpenAI generated closing reply despite affirmative continuation, override it!
-                                    if is_closing_reply(reply_text) and is_continuation:
-                                        print(f"[SAFETY OVERRIDE] Customer continued ('{customer_text}'), but OpenAI gave closing reply. Overriding to job/business.")
-                                        if not job_already_asked:
-                                            if call_language == "en":
-                                                reply_text = "Are you doing a job or business?"
-                                            else:
-                                                reply_text = "సరే అండి! మీరు ప్రస్తుతం జాబ్ చేస్తున్నారా లేదా బిజినెస్ చేస్తున్నారా?"
-
-                                    # End-of-Questionnaire Safety: Before cutting the call with Thank You, ALWAYS ask executive callback day & time!
-                                    callback_already_asked = any(
-                                        is_callback_time_query(m.get("content", ""))
-                                        for m in conversation_history
-                                        if m.get("role") == "assistant"
-                                    )
-                                    if is_closing_reply(reply_text) and not callback_already_asked:
-                                        if len(conversation_history) > 3 and not detect_no(customer_text) and not is_unemployed_response(customer_text):
-                                            print(f"[CALLBACK TIME INTERCEPT] All questions over. Asking executive callback time before closing.")
-                                            if call_language == "en":
-                                                reply_text = "On which day and at what time would it be convenient for our executive to call you?"
-                                            else:
-                                                reply_text = "మా ఎగ్జిక్యూటివ్ మీకు కాల్ చేయడానికి ఏ రోజు, ఏ టైమ్ మీకు కన్వీనియంట్‌గా ఉంటుంది అండి?" 
-
+                                call_language = flow_state.language
+                                tts_language = call_language
+                                reply_text = turn.text
                                 if not reply_text:
-                                    print("OpenAI returned an empty reply.")
                                     continue
-
-                                reply_text = extract_single_question(reply_text)
-
-                                conversation_history.append({
-                                    "role": "assistant",
-                                    "content": reply_text,
-                                })
-
+                                print("[FLOW] stage:", flow_state.pending, "language:", call_language)
                                 print("AI REPLY:", reply_text)
-                                print(f"Streaming speech chunks ({tts_language}) to Plivo...")
-
-                                total_duration, total_bytes, playback_end = await play_chunked_speech(
+                                total_duration, total_bytes, _ = await play_chunked_speech(
                                     websocket=websocket,
                                     text_source=reply_text,
                                     language=tts_language,
@@ -1284,60 +1346,45 @@ async def plivo_audio_stream(websocket: WebSocket):
                                     t_vad_end=time.time(),
                                     call_sid=call_sid,
                                 )
-
-                                ai_speaking_until = playback_end
-                                last_interaction_time = max(time.time(), ai_speaking_until)
-                                print(f"Audio sent to Plivo: {total_bytes} bytes (~{total_duration:.2f}s speech)")
-
-                                # Automatic call hangup detection:
-                                should_close = (
-                                    is_callback_closing
-                                    or (is_closing_reply(reply_text) and not (
-                                        (len(conversation_history) <= 4 and is_continuation)
-                                        or is_company_response(customer_text)
-                                        or is_confusion_or_identity_query(customer_text)
-                                        or is_interest_rate_or_details_query(customer_text)
-                                        or is_repeat_or_clarification_query(customer_text)
-                                        or is_callback_time_query(reply_text)
-                                    ))
-                                    or detect_end_request(customer_text)
-                                )
-                                if should_close:
-                                    print(f"Conversation finished. Closing call stream gracefully. [reply_text='{reply_text}']")
+                                ai_speaking_until = time.time() + total_duration
+                                if turn.close:
+                                    print("[FLOW] Ending call:", flow_state.outcome)
                                     stream_ended_normally = True
-
-                                    # Save immediately to database
                                     if not saved_to_db and conversation_history:
-                                        saved_to_db = True
                                         try:
-                                            call_ended_at = datetime.now(timezone.utc)
-                                            await asyncio.to_thread(
+                                            record = conversation_history + [{
+                                                "role": "system", "content": "CALL_STRUCTURED_DATA=" +
+                                                json.dumps(flow_state.snapshot(), ensure_ascii=False)
+                                            }]
+                                            record_id = await asyncio.to_thread(
                                                 save_call_record,
                                                 call_sid=call_sid,
                                                 phone_number=phone_number,
-                                                conversation_history=conversation_history,
+                                                conversation_history=record,
                                                 call_status="completed",
+                                                lead_status=turn.lead_status or (
+                                                    "follow_up" if flow_state.callback_requested or
+                                                    flow_state.outcome == "callback_requested" else
+                                                    "not_interested" if flow_state.outcome in
+                                                    ("do_not_call", "declined", "wrong_person") else "interested"
+                                                ),
                                                 call_started_at=call_started_at,
-                                                call_ended_at=call_ended_at,
-                                                loan_purpose="AI Agent Cut (Completed normally)",
+                                                call_ended_at=datetime.now(timezone.utc),
+                                                loan_purpose=flow_state.answers.get("purpose", flow_state.outcome),
+                                                loan_type="personal_loan", customer_name=flow_state.customer_name or None,
                                             )
+                                            saved_to_db = record_id is not None
                                         except Exception as db_exc:
-                                            print("Error saving call record to DB:", repr(db_exc))
-
-                                    playback_wait = max(2.5, total_duration + 0.6)
-                                    print(f"[HANGUP] Waiting {playback_wait:.2f}s for playback to complete before telecom line cut...")
-                                    await asyncio.sleep(playback_wait)
+                                            print("Error saving call record:", repr(db_exc))
+                                    # Wait until audio has played before cutting telecom line.
+                                    await asyncio.sleep(max(0.4, total_duration + 0.5))
                                     call_done_event.set()
                                     try:
                                         await websocket.close()
                                     except Exception:
                                         pass
                                     if call_sid:
-                                        print(f"[HANGUP] Line cut triggered via Plivo REST API for: {call_sid}")
-                                        try:
-                                            await asyncio.to_thread(hangup_plivo_call, call_sid)
-                                        except Exception as hang_exc:
-                                            print("Error in hangup_plivo_call:", repr(hang_exc))
+                                        await asyncio.to_thread(hangup_plivo_call, call_sid)
                                     break
 
                             except Exception as exc:
@@ -1413,149 +1460,8 @@ async def plivo_audio_stream(websocket: WebSocket):
                 finally:
                     call_done_event.set()
 
-            async def silence_watchdog():
-                nonlocal silence_prompt_stage, last_interaction_time, saved_to_db, stream_ended_normally, ai_speaking_until, is_processing_turn
-                try:
-                    # Wait until opening message has completed playing
-                    while not call_done_event.is_set() and not opening_already_spoken:
-                        await asyncio.sleep(0.5)
-
-                    while not call_done_event.is_set():
-                        await asyncio.sleep(1.0)
-
-                        if call_done_event.is_set():
-                            break
-
-                        # If AI is currently thinking or speaking, silence timer does not tick
-                        if is_ai_active():
-                            last_interaction_time = max(time.time(), ai_speaking_until)
-                            continue
-
-                        now = time.time()
-                        silence_duration = now - last_interaction_time
-
-                        # Stage 0: 20 seconds of customer silence -> play reminder
-                        if silence_prompt_stage == 0 and silence_duration >= 20.0:
-                            print(f"[SILENCE WATCHDOG] 20s customer silence detected ({silence_duration:.1f}s). Playing reminder prompt.")
-                            silence_prompt_stage = 1
-
-                            if len(conversation_history) <= 2:
-                                if call_language == "en":
-                                    reminder_text = "Hello, are you there? This is Sneha calling regarding ICICI Bank personal loans. Do you need a personal loan?"
-                                else:
-                                    reminder_text = "హలో, లైన్‌లో ఉన్నారా అండి? నేను ఐసీఐసీఐ బ్యాంక్ పర్సనల్ లోన్ గురించి మాట్లాడుతున్నాను. మీకు పర్సనల్ లోన్ అవసరమా?"
-                            else:
-                                if call_language == "en":
-                                    reminder_text = "Hello, are you there? Could you please confirm your answer?"
-                                else:
-                                    reminder_text = "హలో, లైన్‌లో ఉన్నారా అండి? మీ సమాధానం చెప్పగలరా?"
-
-                            conversation_history.append({
-                                "role": "assistant",
-                                "content": reminder_text,
-                            })
-                            print(f"[SILENCE WATCHDOG] Reminder: '{reminder_text}'")
-
-                            is_processing_turn = True
-                            try:
-                                tts_lang = call_language or "te"
-                                total_dur, total_b, playback_end = await play_chunked_speech(
-                                    websocket=websocket,
-                                    text_source=reminder_text,
-                                    language=tts_lang,
-                                    call_audio_path=call_audio_path,
-                                    silence_ms=60,
-                                    t_vad_end=time.time(),
-                                    call_sid=call_sid,
-                                )
-                                ai_speaking_until = playback_end
-                                last_interaction_time = max(time.time(), ai_speaking_until)
-                            except Exception as rem_err:
-                                print("[SILENCE WATCHDOG] Failed to play reminder:", rem_err)
-                                last_interaction_time = time.time()
-                            finally:
-                                is_processing_turn = False
-
-                        # Stage 1: 30 seconds of further silence after reminder -> farewell and hang up
-                        elif silence_prompt_stage == 1 and silence_duration >= 30.0:
-                            print(f"[SILENCE WATCHDOG] 30s silence after reminder ({silence_duration:.1f}s). Ending call.")
-                            silence_prompt_stage = 2
-                            stream_ended_normally = True
-
-                            if call_language == "en":
-                                farewell_text = "Thank you for your time. Have a nice day!"
-                            else:
-                                farewell_text = "సరే అండి, మీ విలువైన సమయానికి ధన్యవాదాలు. హావ్ ఏ నైస్ డే!"
-
-                            conversation_history.append({
-                                "role": "assistant",
-                                "content": farewell_text,
-                            })
-                            print(f"[SILENCE WATCHDOG] Farewell: '{farewell_text}'")
-
-                            is_processing_turn = True
-                            try:
-                                tts_lang = call_language or "te"
-                                total_dur, total_b, _ = await play_chunked_speech(
-                                    websocket=websocket,
-                                    text_source=farewell_text,
-                                    language=tts_lang,
-                                    call_audio_path=call_audio_path,
-                                    silence_ms=60,
-                                    t_vad_end=time.time(),
-                                    call_sid=call_sid,
-                                )
-                                playback_wait = max(2.5, total_dur + 0.6)
-                                print(f"[SILENCE WATCHDOG] Waiting {playback_wait:.2f}s before cutting line...")
-                                await asyncio.sleep(playback_wait)
-                            except Exception as fare_err:
-                                print("[SILENCE WATCHDOG] Failed to play farewell:", fare_err)
-                            finally:
-                                is_processing_turn = False
-
-                            # Save to database
-                            if not saved_to_db and conversation_history:
-                                saved_to_db = True
-                                try:
-                                    call_ended_at = datetime.now(timezone.utc)
-                                    conversation_history.append({
-                                        "role": "system",
-                                        "content": "Call ended: AI agent timed out after customer silence (20s + 30s) and cut the call",
-                                    })
-                                    await asyncio.to_thread(
-                                        save_call_record,
-                                        call_sid=call_sid,
-                                        phone_number=phone_number,
-                                        conversation_history=conversation_history,
-                                        call_status="completed",
-                                        call_started_at=call_started_at,
-                                        call_ended_at=call_ended_at,
-                                        loan_purpose="AI Agent Cut (Silence Timeout)",
-                                    )
-                                except Exception as db_exc:
-                                    print("Error saving call record to DB on silence timeout:", repr(db_exc))
-
-                            call_done_event.set()
-                            try:
-                                await websocket.close()
-                            except Exception:
-                                pass
-                            if call_sid:
-                                print(f"[SILENCE WATCHDOG] Cutting telecom line via Plivo API for: {call_sid}")
-                                try:
-                                    await asyncio.to_thread(hangup_plivo_call, call_sid)
-                                except Exception as h_exc:
-                                    print("Error in hangup_plivo_call on silence timeout:", repr(h_exc))
-                            break
-
-                except asyncio.CancelledError:
-                    pass
-                except Exception as exc:
-                    print("[SILENCE WATCHDOG] Error:", repr(exc))
-
             opening_already_spoken = False
             listener_task = asyncio.create_task(receive_sarvam_results())
-            silence_task = asyncio.create_task(silence_watchdog())
 
             print("Sarvam realtime transcription connected.")
 
@@ -1582,11 +1488,12 @@ async def plivo_audio_stream(websocket: WebSocket):
                         asyncio.create_task(asyncio.to_thread(start_plivo_recording, stream_call_id))
                         meta = (
                             ACTIVE_CALL_METADATA.get(stream_call_id)
-                            or ACTIVE_CALL_METADATA.get("latest")
-                            or (list(ACTIVE_CALL_METADATA.values())[-1] if ACTIVE_CALL_METADATA else None)
+
                         )
                         if meta:
                             phone_number = meta.get("phone_number")
+                            is_customer_return_call = bool(meta.get("is_customer_return_call", False))
+                            flow_state.customer_name = meta.get("customer_name", "") or ""
                             if "started_at" in meta:
                                 call_started_at = meta["started_at"]
 
@@ -1596,15 +1503,14 @@ async def plivo_audio_stream(websocket: WebSocket):
                     call_audio_path = ALL_CALL_RECORDINGS_DIR / f"call_{call_sid}.ulaw"
 
                     try:
-                        opening_text, opening_len, opening_duration, playback_end = await speak_opening_message(
+                        opening_text, opening_len, opening_duration = await speak_opening_message(
                             websocket,
                             call_audio_path=call_audio_path,
                             call_sid=call_sid,
                             language="en",
+                            customer_name=flow_state.customer_name,
                         )
-                        ai_speaking_until = playback_end
-                        last_interaction_time = max(time.time(), ai_speaking_until)
-                        silence_prompt_stage = 0
+                        ai_speaking_until = time.time() + opening_duration
                         if not conversation_history:
                             conversation_history.append({
                                 "role": "assistant",
@@ -1613,8 +1519,6 @@ async def plivo_audio_stream(websocket: WebSocket):
                         opening_already_spoken = True
                     except Exception as exc:
                         print("Opening speech failed:", repr(exc))
-                        opening_already_spoken = True
-                        last_interaction_time = time.time()
 
                 elif event_type == "media":
                     media = message.get("media", {})
@@ -1623,13 +1527,15 @@ async def plivo_audio_stream(websocket: WebSocket):
                         if audio_packet_count == 1:
                             print("First inbound Plivo audio packet received.")
 
-                        # Continuous feed to Sarvam AI STT so VAD stays alive and captures user speech immediately
-                        await sarvam_socket.send_realtime_audio_input(
-                            RealtimeAudioInput(audio=media["payload"])
-                        )
+                        if not is_ai_active():
+                            await sarvam_socket.send_realtime_audio_input(
+                                RealtimeAudioInput(audio=media["payload"])
+                            )
 
                 elif event_type == "stop":
                     print("Plivo stream stopped.")
+                    cancel_call_tts(call_sid)
+                    await clear_plivo_audio_queue(websocket)
                     break
 
     except WebSocketDisconnect:
@@ -1638,12 +1544,13 @@ async def plivo_audio_stream(websocket: WebSocket):
         print("Streaming error:", repr(exc))
     finally:
         call_done_event.set()
-        if silence_task:
-            silence_task.cancel()
-            try:
-                await silence_task
-            except (asyncio.CancelledError, Exception):
-                pass
+        cancel_call_tts(call_sid)
+        _release_outbound_guard(phone_number=phone_number or "", call_uuid=call_sid or "")
+        try:
+            await clear_plivo_audio_queue(websocket)
+        except Exception:
+            pass
+
         if listener_task:
             listener_task.cancel()
             try:
@@ -1668,28 +1575,76 @@ async def plivo_audio_stream(websocket: WebSocket):
                         "role": "system",
                         "content": "Call ended: User left the call (Customer disconnected midway)"
                     })
+                record = conversation_history + [{"role": "system", "content":
+                      "CALL_STRUCTURED_DATA=" + json.dumps(flow_state.snapshot(), ensure_ascii=False)}]
                 await asyncio.to_thread(
                     save_call_record,
                     call_sid=call_sid,
                     phone_number=phone_number,
-                    conversation_history=conversation_history,
+                    conversation_history=record,
                     call_status=saved_status,
                     call_started_at=call_started_at,
                     call_ended_at=call_ended_at,
                     loan_purpose=outcome_desc,
+                    loan_type="personal_loan",
+                    customer_name=flow_state.customer_name or None,
                 )
             except Exception as db_exc:
                 print("Error saving call conversation to database in finally:", repr(db_exc))
 
 
 @app.get("/calls")
-def get_recorded_calls():
+def get_recorded_calls(
+    loan_type: Optional[str] = "personal_loan",
+    current_admin: Dict[str, Any] = Depends(require_admin_user),
+):
     """Retrieve recorded calls from PostgreSQL public.ai_agent_calls table."""
-    return fetch_all_calls()
+    return fetch_all_calls(loan_type=loan_type)
+
+
+class DeleteCallsBatchRequest(BaseModel):
+    call_ids: List[int] = []
+    delete_test_only: bool = False
+
+
+@app.post("/calls/delete-batch")
+def remove_personal_loan_calls_batch(
+    payload: DeleteCallsBatchRequest,
+    current_admin: Dict[str, Any] = Depends(require_admin_user),
+):
+    """Batch-delete Personal Loan DB rows strictly restricted to loan_type='personal_loan'."""
+    result = delete_personal_loan_calls_batch(
+        call_ids=payload.call_ids,
+        delete_test_only=payload.delete_test_only,
+        all_call_recordings_dir=ALL_CALL_RECORDINGS_DIR,
+    )
+    if not result.get("success"):
+        status_code = 400 if result.get("bad_request") else 500
+        raise HTTPException(status_code=status_code, detail=result.get("error", "Batch delete failed"))
+    return result
+
+
+@app.delete("/calls/{call_id}")
+def remove_personal_loan_call(
+    call_id: int,
+    current_admin: Dict[str, Any] = Depends(require_admin_user),
+):
+    """Delete a single Personal Loan DB row strictly restricted to loan_type='personal_loan'."""
+    result = delete_personal_loan_call(call_id, ALL_CALL_RECORDINGS_DIR)
+    if not result.get("success"):
+        if result.get("not_found"):
+            raise HTTPException(status_code=404, detail=result.get("error", "Call not found"))
+        if result.get("forbidden"):
+            raise HTTPException(status_code=403, detail=result.get("error", "Forbidden"))
+        raise HTTPException(status_code=500, detail=result.get("error", "Delete failed"))
+    return result
 
 
 @app.get("/recording/{call_id}")
-def stream_call_recording(call_id: int):
+def stream_call_recording(
+    call_id: int,
+    current_admin: Dict[str, Any] = Depends(require_admin_user),
+):
     """Stream and play call recording directly from PostgreSQL recording_data BYTEA."""
     audio_bytes, call_sid = fetch_call_recording(call_id, ALL_CALL_RECORDINGS_DIR)
     if not audio_bytes:
